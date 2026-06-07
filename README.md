@@ -2,7 +2,7 @@
 
 This reproduces the goroutine-local-storage (GLS) span leak that shows up in Orchestrion builds of `dd-trace-go/v2`. There's no contrib in it. No franz-go, no kafka, no http, nothing. The leak sits in the core tracer, in the `ContextWithSpan` push paired against the `Span.Finish` pop, so a handful of plain `tracer` calls is enough to trigger it.
 
-It's the same class of leak that [DataDog/dd-trace-go#4808][pr] fixes.
+It lives in the same area as [DataDog/dd-trace-go#4808][pr] (GLS push/pop accounting). Heads up, though: as the numbers further down show, that PR doesn't actually clear this particular case.
 
 [pr]: https://github.com/DataDog/dd-trace-go/pull/4808
 
@@ -32,7 +32,7 @@ In Orchestrion builds, `dd-trace-go` keeps a per-goroutine stack of the active s
 
 Each push and pop is scoped to the goroutine that made the call. So the stack only balances when the goroutine that pushed a span is also the one that finishes it. Push a span with `ContextWithSpan` on goroutine A, finish it with `Finish` on goroutine B, and A's push never gets popped. B just pops its own stack. That one span sticks around on A's GLS stack for good, once per re-injection. On a long-lived worker it adds up into a real leak.
 
-#4808 fixes this by grabbing a goroutine-scoped popper at push time and calling it once when the span finishes, so the pop always lands on the right goroutine. A double finish can't double-pop anymore either.
+#4808 reworks this: it grabs a goroutine-scoped popper at push time and invokes it once on finish, so the pop only fires on the goroutine that pushed. That stops a double finish from double-popping, and stops a finish on the wrong goroutine from corrupting that goroutine's stack. It does not make the leak above go away, though. When the pushing goroutine never finishes the span itself (someone else does, on another goroutine), the captured popper just no-ops on the finishing goroutine and the pushed entry stays put. See "What #4808 changes here" below.
 
 ## How this repro triggers it
 
@@ -73,17 +73,21 @@ orchestrion go build -o gls-leak . && ./gls-leak -n 200000
 
 > Note: you only see the leak when you build with orchestrion. `orchestrion.tool.go` pulls in `dd-trace-go/orchestrion/all/v2`, the standard orchestrion bootstrap, and that's what switches the core GLS on at build time. The repro code itself still calls zero integrations; `all` is purely the build-time enabler. Drop it and the GLS goes away along with the leak, which is another way of showing the problem lives in the core tracer rather than any contrib.
 
-## Confirming the fix
+## What #4808 changes here (and what it doesn't)
 
-Point the module at a `dd-trace-go/v2` build that includes [#4808][pr], then run it again under orchestrion:
+I ran the repro against the PR commit (`ed0c1c76`, pseudo-version `v2.9.0-dev.0.20260527133435-ed0c1c761872`):
 
 ```
-go get github.com/DataDog/dd-trace-go/v2@<version-or-commit-with-#4808>
+go get github.com/DataDog/dd-trace-go/v2@ed0c1c761872be8b4d9d020eee9ad05667b13b3c
 go mod tidy
 orchestrion go run . -n 200000
 ```
 
-You should see `retained heap objects` per record fall back to ~0, same as the plain build.
+The leak is still there: ~16 retained objects per record under orchestrion, basically the same as v2.8.2. The plain build stays at ~0 either way.
+
+That tracks with the fix, and the PR says as much: it lists "cross-goroutine leak (not corruption) of the pusher's slot survives this fix" as a known residual gap, out of scope and tracked separately. `GLSPopFunc` captures a popper bound to the goroutine that pushed, and on any other goroutine the pop is a deliberate no-op (so it can't corrupt that goroutine's stack). Here the worker pushes and the owner finishes, so the pop no-ops on the owner and the worker's entry is never released. #4808 makes cross-goroutine finish *safe*; it doesn't reclaim a slot that was pushed on a goroutine which never finishes the span.
+
+So if your code re-injects a span on one goroutine and lets a different goroutine finish it, #4808 on its own won't stop the growth.
 
 ## Real-world shape (why it matters)
 
@@ -95,11 +99,11 @@ ctx = tracer.ContextWithSpan(ctx, span) // re-inject on the WORKER goroutine
 // ... handle the record ...
 ```
 
-The instrumentation finishes the consume span on a different goroutine from the worker that re-injected it. One leaked GLS entry per record, and on a hot partition that just keeps climbing. Until the core fix lands you can work around it by opening a worker-owned child span and `defer child.Finish()` on the same worker goroutine, which keeps push and pop balanced locally. The real fix is #4808.
+The instrumentation finishes the consume span on a different goroutine from the worker that re-injected it. One leaked GLS entry per record, and on a hot partition that just keeps climbing. The fix that actually works is to keep push and pop on the same goroutine: open a worker-owned child span and `defer child.Finish()` on the worker, so the worker both pushes and pops. That holds regardless of #4808.
 
 ## Environment used to capture the numbers above
 
-- `dd-trace-go/v2` `v2.8.2`
+- `dd-trace-go/v2` `v2.8.2` (and `v2.9.0-dev.0.20260527133435-ed0c1c761872`, the #4808 commit, where the leak persists)
 - `orchestrion` `v1.10.0`
 - Go `1.25`/`1.26`, `darwin/arm64`
 
